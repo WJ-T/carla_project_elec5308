@@ -79,77 +79,107 @@ def setup_tm(client, npcs):
 
 def hero_avoid_control(world, hero):
     """
-    简单双层策略：
-    1) 车道跟随：沿着路网 waypoint 前瞻方向转向；
-    2) 避让：
-       - 前向最近车辆：距离 < SAFE_HEADWAY → 减小油门；< BRAKE_DISTANCE → 刹车；
-       - 侧向车辆：距离 < AVOID_RADIUS → 根据横向相对位置施加转向修正（把方向打离它）。
-    3) 油门 PID（简化）：按速度误差调整 throttle。
+    改进：Stanley 车道保持 + 路口/大曲率限速 + 边界排斥 + 温和避让
     """
     m = world.get_map()
-    hero_tf = hero.get_transform()
-    hero_wp = m.get_waypoint(hero_tf.location, project_to_road=True, lane_type=carla.LaneType.Driving)
-
-    # 前瞻 waypoint -> 目标方向
-    lookahead = 6.0  # 前瞻距离（米）
-    wps = hero_wp.next(lookahead)
-    if not wps:
-        target_yaw = hero_tf.rotation.yaw
-    else:
-        target_yaw = wps[0].transform.rotation.yaw
-
-    # 基础转向：朝向目标 yaw
-    yaw_err = angle_diff(target_yaw, hero_tf.rotation.yaw) / 90.0  # 归一化到[-1,1]附近
-    steer_cmd = max(-MAX_STEER, min(MAX_STEER, 0.6 * yaw_err))
-
-    # 感知周边车辆
-    actors = world.get_actors().filter('vehicle.*')
-    hx, hy = hero_tf.location.x, hero_tf.location.y
-    yaw_rad = math.radians(hero_tf.rotation.yaw)
-    front_vec = (math.cos(yaw_rad), math.sin(yaw_rad))
-
-    min_front_dist = float('inf')
-    for v in actors:
-        if v.id == hero.id: continue
-        loc = v.get_transform().location
-        dx, dy = loc.x - hx, loc.y - hy
-        # 前后判断：与前向向量点积>0 表示在前方
-        front_proj = dx*front_vec[0] + dy*front_vec[1]
-        lateral = -dx*front_vec[1] + dy*front_vec[0]  # 右为正、左为负（车辆局部坐标）
-        dist2 = dx*dx + dy*dy
-        dist = math.sqrt(dist2)
-
-        # 前车距离（用于跟车/刹车）
-        if front_proj > 0 and abs(lateral) < 3.0:  # 同车道或相邻、在正前方
-            if dist < min_front_dist:
-                min_front_dist = dist
-
-        # 侧向避让：在影响半径内，根据横向位置对 steer 做修正（把方向打离它）
-        if dist < AVOID_RADIUS:
-            steer_cmd += AVOID_GAIN * (-lateral)  # lateral>0在右侧 → 往左打（负号）；反之亦然
-
-    # 油门/刹车
+    tf = hero.get_transform()
     v = hero.get_velocity()
-    speed = calc_speed(v)
-    throttle = 0.0
-    brake = 0.0
+    speed = calc_speed(v) + 1e-3
 
-    # 跟车策略
-    if min_front_dist < BRAKE_DISTANCE:
-        brake = 0.7
-    elif min_front_dist < SAFE_HEADWAY:
-        # 逼近前车则减速：把目标速度降到前车距离/SAFE_HEADWAY 的比例
-        reduce = max(0.3, min(1.0, (min_front_dist - BRAKE_DISTANCE)/(SAFE_HEADWAY - BRAKE_DISTANCE)))
-        target_v = TARGET_SPEED * reduce
-        err = max(0.0, target_v - speed)
-        throttle = max(0.0, min(0.6, 0.15*err))
+    # 1) 取得当前车道中心（用于横向误差）和前瞻路径（用于航向误差）
+    wp = m.get_waypoint(tf.location, project_to_road=True,
+                        lane_type=carla.LaneType.Driving)
+
+    # 路口/分叉时，挑选“与当前车头夹角最小”的下一条路
+    lookahead = 6.0
+    next_wps = wp.next(lookahead)
+    if not next_wps:
+        target_wp = wp
     else:
-        # 正常巡航 PID（简化）
-        err = TARGET_SPEED - speed
-        throttle = max(0.0, min(0.8, 0.12*err))
+        def yaw_diff(w):
+            return abs(angle_diff(w.transform.rotation.yaw, tf.rotation.yaw))
+        target_wp = min(next_wps, key=yaw_diff)
 
-    steer_cmd = max(-MAX_STEER, min(MAX_STEER, steer_cmd))
+    target_yaw = target_wp.transform.rotation.yaw
+
+    # 2) Stanley 控制器（heading + cross track）
+    # 车辆坐标系前向（单位向量）
+    yaw = math.radians(tf.rotation.yaw)
+    front_vec = (math.cos(yaw), math.sin(yaw))
+
+    # 车道切线朝向
+    tyaw = math.radians(target_yaw)
+    tangent = (math.cos(tyaw), math.sin(tyaw))
+
+    # 横向误差：英雄车位置到道路中心的矢量，在车辆坐标系的“侧向”分量
+    dx = target_wp.transform.location.x - tf.location.x
+    dy = target_wp.transform.location.y - tf.location.y
+    lateral_err = -dx*front_vec[1] + dy*front_vec[0]  # 右正左负
+
+    # 航向误差
+    heading_err = math.radians(angle_diff(target_yaw, tf.rotation.yaw))
+
+    # Stanley：δ = ψ_err + atan(k * e / (v + ε))
+    K_STANLEY = 1.0
+    steer_cmd = heading_err + math.atan2(K_STANLEY * lateral_err, speed)
+
+    # 3) 边界排斥（靠近车道边缘时，往中心推）
+    lane_w = wp.lane_width if wp.lane_width > 0 else 3.5
+    # 以中心为 0，绝对值越大越接近路沿
+    center_offset = lateral_err
+    ratio = abs(center_offset) / (0.5 * lane_w)  # >1 表示越界
+    if ratio > 0.6:  # 开始感到“挤边”
+        repel = 0.5 * (ratio - 0.6)  # 0~0.5 的附加项
+        steer_cmd += -math.copysign(repel, center_offset)  # 往中心打
+
+    # 4) 周围车辆避让（温和版）
+    AVOID_R = 10.0
+    AVOID_K = 0.015  # 比你原来小，避免被 NPC 直接“别到路沿”
+    min_front = float('inf')
+    actors = world.get_actors().filter('vehicle.*')
+    hx, hy = tf.location.x, tf.location.y
+    for a in actors:
+        if a.id == hero.id: 
+            continue
+        loc = a.get_transform().location
+        dx, dy = loc.x - hx, loc.y - hy
+        front_proj = dx*front_vec[0] + dy*front_vec[1]
+        lateral = -dx*front_vec[1] + dy*front_vec[0]
+        dist = math.hypot(dx, dy)
+
+        # 前向同车道“跟车距离”
+        if front_proj > 0 and abs(lateral) < 3.0:
+            min_front = min(min_front, dist)
+
+        # 侧向避让（在影响半径内：往远离它的方向打一点点）
+        if dist < AVOID_R:
+            steer_cmd += AVOID_K * (-lateral)
+
+    # 5) 弯道/路口限速：大转角或在 junction 内 → 降速
+    TARGET_V = TARGET_SPEED
+    corner = abs(angle_diff(target_yaw, tf.rotation.yaw))
+    if target_wp.is_junction or corner > 25:  # 路口或大弯
+        TARGET_V = min(TARGET_V, 8.0)         # ~30 km/h
+    if corner > 45:
+        TARGET_V = min(TARGET_V, 6.0)
+
+    # 跟车再降速
+    if min_front < BRAKE_DISTANCE:
+        brake = 0.7; throttle = 0.0
+    elif min_front < SAFE_HEADWAY:
+        scale = max(0.3, min(1.0, (min_front - BRAKE_DISTANCE)/
+                              (SAFE_HEADWAY - BRAKE_DISTANCE)))
+        TARGET_V *= scale
+        brake = 0.0
+        throttle = max(0.0, min(0.6, 0.15*(TARGET_V - speed)))
+    else:
+        brake = 0.0
+        throttle = max(0.0, min(0.8, 0.12*(TARGET_V - speed)))
+
+    # 6) 限幅并下发控制
+    steer_cmd = float(max(-MAX_STEER, min(MAX_STEER, steer_cmd)))
     hero.apply_control(carla.VehicleControl(throttle=throttle, steer=steer_cmd, brake=brake))
+
 
 def main():
     client = carla.Client(HOST, PORT)
