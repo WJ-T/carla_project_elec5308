@@ -17,11 +17,21 @@ It demonstrates:
   (CARLA official wheels only support Python 3.7)
   ```bash
   winget install -e --id Python.Python.3.7
+  ```
+  For lab device, please download it manually, and then use
+  ```
+  set PATH=C:\Python37;%PATH%
+  ```
+  to make 3.7 as default for temp
 
 - **Install from the local wheel:**:
   ```bash
   pip install /path/to/carla-0.9.15-cp37-cp37m-win_amd64.whl
-
+  ```
+  for lab device, 
+  ```
+  path\to\python.exe -m pip install C:\Carla\PythonAPI\carla\dist\carla-0.9.15-cp37-cp37m-win_amd64.whl 
+  ```
 
 ## Start Carla server
 From a terminal (adjust path to your installation and parameter by your device performance):
