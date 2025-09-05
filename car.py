@@ -1,4 +1,4 @@
-# auto_pilot_with_npc.py —— 不改地图 + 同步模式 + 主角&NPC自动驾驶(TM) + 平滑跟随
+# auto_pilot_with_npc.py —— 不改地图 + 同步模式 + 主角&NPC自动驾驶(TM) + 平滑跟随 + 自适应节拍
 import time, math, random
 import carla
 
@@ -12,14 +12,14 @@ CAM_DIST  = 8.0            # 相机在车后距离（米）
 CAM_HEIGHT= 3.0
 CAM_PITCH = -12.0
 
-NUM_NPC   = 18             # 生成的 NPC 数量（核显建议 8~15）
-MIN_GAP_M = 8.0            # ★ 与前车的最低目标距离（米）（全局）
-HERO_SPEED_DELTA = -40       # 主角相对限速的百分比（负数=更快，正数=更慢）
+NUM_NPC   = 60             # 生成的 NPC 数量
+MIN_GAP_M = 6.0            # 与前车的最低目标距离（米）
+HERO_SPEED_DELTA = -90     # 主角相对限速的百分比（负数=更快，正数=更慢）
 NPC_SPEED_MIN    = 0       # NPC个体速度差范围（百分比）
 NPC_SPEED_MAX    = 15      # 例如 [0,15] 表示比限速慢 0~15%
 AUTO_LC_HERO     = True    # 主角是否允许自动变道
 AUTO_LC_NPC      = True    # NPC 是否允许自动变道
-IGNORE_LIGHTS_P  = 0.0     # 忽略红绿灯概率[0,100]（保持 0 最守规矩）
+IGNORE_LIGHTS_P  = 0.0     # 忽略红绿灯概率[0,100]
 IGNORE_SIGNS_P   = 0.0     # 忽略交通标志概率[0,100]
 
 # ====== 工具函数 ======
@@ -58,13 +58,28 @@ def spawn_npcs(world, count):
         if len(out) >= count: break
     return out
 
+def shorten_all_lights(world, green=3.0, yellow=1.0, red=3.0):
+    """缩短全局红绿灯周期"""
+    tls = world.get_actors().filter('traffic.traffic_light')
+    for tl in tls:
+        try:
+            tl.set_green_time(green)
+            tl.set_yellow_time(yellow)
+            tl.set_red_time(red)
+        except RuntimeError:
+            pass
+    print(f"[LIGHTS] cycles set to G={green}s Y={yellow}s R={red}s")
+
 def main():
     client = carla.Client(HOST, PORT)
     client.set_timeout(20.0)
 
-    # 只使用当前地图
-    world = client.get_world()
-    print("[MAP]", world.get_map().name)
+    # —— 随机地图 ——
+    maps = ["Town01","Town02","Town03","Town04","Town05","Town07","Town10HD_Opt"]
+    chosen = random.choice(maps)
+    world = client.load_world(chosen)
+    print(f"[MAP] Loaded {chosen}")
+    shorten_all_lights(world, green=3.0, yellow=1.0, red=1.0)
 
     # —— 进入同步模式（保存&还原设置） ——
     original_settings = world.get_settings()
@@ -76,10 +91,8 @@ def main():
     # —— Traffic Manager 设置 ——
     tm = client.get_trafficmanager(TM_PORT)
     tm.set_synchronous_mode(True)
-
-    # 全局“最低距离”与速度偏差（注意：TM 用“期望最小间距”来影响跟车）
     tm.set_global_distance_to_leading_vehicle(MIN_GAP_M)
-    tm.global_percentage_speed_difference(0)  # 仅作用于未单独设置过的车辆
+    tm.global_percentage_speed_difference(0)
 
     # —— 生成主角（优先 model3） ——
     hero = spawn_one(world, "vehicle.tesla.model3")
@@ -92,60 +105,56 @@ def main():
     npcs = spawn_npcs(world, NUM_NPC)
     print(f"[NPC] spawned: {len(npcs)}")
 
-    # —— 将全部车辆交给 TM 自动驾驶，并按角色设置参数 ——
-    # 主角
+    # —— Autopilot 设置 ——
     hero.set_autopilot(True, TM_PORT)
-    tm.vehicle_percentage_speed_difference(hero, HERO_SPEED_DELTA)  # 相对限速的百分比
+    tm.vehicle_percentage_speed_difference(hero, HERO_SPEED_DELTA)
     tm.auto_lane_change(hero, AUTO_LC_HERO)
     tm.ignore_lights_percentage(hero, IGNORE_LIGHTS_P)
     tm.ignore_signs_percentage(hero, IGNORE_SIGNS_P)
 
-    # NPC：给每台车一个轻微不同的速度偏差，允许变道
     for v in npcs:
         v.set_autopilot(True, TM_PORT)
         tm.auto_lane_change(v, AUTO_LC_NPC)
         tm.ignore_lights_percentage(v, IGNORE_LIGHTS_P)
         tm.ignore_signs_percentage(v, IGNORE_SIGNS_P)
-        # 让 NPC 整体“比限速慢一点”，促使后车在安全时变道绕行
         slow_pct = random.randint(NPC_SPEED_MIN, NPC_SPEED_MAX)
         tm.vehicle_percentage_speed_difference(v, slow_pct)
-        # 可选：给轻微的车道内侧向偏移，显得更自然
-        # tm.vehicle_lane_offset(v, random.uniform(-0.2, 0.2))
 
-    # —— 相机：平滑追尾主角 ——
+    # —— 相机跟随 ——
     spectator = world.get_spectator()
-    world.tick()  # 先推进一帧，确保有有效 transform
+    world.tick()
     curr_tf = follow_transform(hero.get_transform())
     spectator.set_transform(curr_tf)
 
     print("主角+NPC 自动驾驶（TM）运行中...  Ctrl+C 退出（不销毁）")
+
+    last_tick = time.perf_counter()
+
     try:
         while True:
-            world.tick()  # 与模拟同步推进
+            world.tick()
 
-            target_tf = follow_transform(hero.get_transform())
-            # 位置平滑
-            cur_loc = curr_tf.location
-            tgt_loc = target_tf.location
+            # 相机平滑
+            tgt = follow_transform(hero.get_transform())
             sm_loc = carla.Location(
-                x=lerp(cur_loc.x, tgt_loc.x, CAM_ALPHA),
-                y=lerp(cur_loc.y, tgt_loc.y, CAM_ALPHA),
-                z=lerp(cur_loc.z, tgt_loc.z, CAM_ALPHA)
+                x=lerp(curr_tf.location.x, tgt.location.x, CAM_ALPHA),
+                y=lerp(curr_tf.location.y, tgt.location.y, CAM_ALPHA),
+                z=lerp(curr_tf.location.z, tgt.location.z, CAM_ALPHA)
             )
-            # 朝向平滑
-            cur_rot = curr_tf.rotation
-            tgt_rot = target_tf.rotation
             sm_rot = carla.Rotation(
-                pitch=lerp(cur_rot.pitch, tgt_rot.pitch, CAM_ALPHA),
-                yaw=lerp(cur_rot.yaw, tgt_rot.yaw, CAM_ALPHA),
+                pitch=lerp(curr_tf.rotation.pitch, tgt.rotation.pitch, CAM_ALPHA),
+                yaw=lerp(curr_tf.rotation.yaw,   tgt.rotation.yaw,   CAM_ALPHA),
                 roll=0.0
             )
-
             curr_tf = carla.Transform(sm_loc, sm_rot)
             spectator.set_transform(curr_tf)
 
-            # 避免“快进”（按 FIXED_DT 节拍跑）
-            time.sleep(FIXED_DT)
+            # —— 自适应节拍 ——（避免 tick 本身已慢还继续 sleep）
+            now = time.perf_counter()
+            elapsed = now - last_tick
+            if elapsed < FIXED_DT:
+                time.sleep(FIXED_DT - elapsed)
+            last_tick = time.perf_counter()
 
     except KeyboardInterrupt:
         print("\n退出脚本（车辆仍在场景中；设置已还原）。")
